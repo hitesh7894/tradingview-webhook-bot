@@ -1,25 +1,17 @@
 from flask import Flask, request
 import os
 import requests
-import time
-import hmac
-import hashlib
 
 app = Flask(__name__)
 
+# Delta Exchange API credentials
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
-BASE_URL = "https://api.delta.exchange"
-
-# Capital & leverage setup
+# Capital Settings
 TOTAL_CAPITAL = 10000  # ₹
-POSITION_PERCENT = 0.20  # 20% per trade
+TRADE_PERCENT = 0.20  # 20%
 LEVERAGE = 5
-
-# Contract details
-CONTRACT_SYMBOL = "SOLUSD"
-CONTRACT_ID = 216  # ID for SOLUSD perpetual (check Delta docs if needed)
 
 @app.route('/', methods=['GET'])
 def home():
@@ -28,95 +20,51 @@ def home():
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
-    print("Received signal:", data)
+    print("Received alert:", data)
 
-    side = data.get("side")  # "buy" or "sell"
-    if side not in ["buy", "sell"]:
-        return "Invalid signal", 400
+    signal = data.get("signal")
+    symbol = data.get("symbol")
 
-    direction = 1 if side == "buy" else -1
-    capital = TOTAL_CAPITAL * POSITION_PERCENT
-    margin = capital / LEVERAGE
+    if signal not in ["buy", "sell"] or symbol != "SOLUSDT":
+        return "Invalid data", 400
 
-    # Fetch latest price to calculate size
-    price = get_latest_price()
-    if price is None:
-        return "Failed to get price", 500
+    # Fetch SOLUSDT price from Delta
+    price_data = requests.get("https://api.delta.exchange/v2/markets/SOLUSDT").json()
+    mark_price = float(price_data["result"]["mark_price"])
+    print("Mark Price:", mark_price)
 
-    size = round(margin * LEVERAGE / price, 3)  # approx quantity of SOL
+    capital_to_use = TOTAL_CAPITAL * TRADE_PERCENT  # ₹2000
+    usdt_amount = capital_to_use * LEVERAGE         # ₹2000 * 5 = ₹10,000 worth
+    quantity = round(usdt_amount / mark_price, 4)   # Coin quantity to buy/sell
 
-    place_order(direction, size, price)
+    side = "buy" if signal == "buy" else "sell"
+    stop_loss = round(mark_price * (0.95 if side == "buy" else 1.05), 2)
+    take_profit = round(mark_price * (1.10 if side == "buy" else 0.90), 2)
 
-    return "Order Executed", 200
+    headers = {
+        "api-key": DELTA_API_KEY,
+        "Content-Type": "application/json"
+    }
 
-
-def get_latest_price():
-    try:
-        response = requests.get(f"{BASE_URL}/v2/tickers/SOLUSD")
-        return float(response.json()["result"]["mark_price"])
-    except:
-        return None
-
-def place_order(direction, size, entry_price):
-    timestamp = str(int(time.time() * 1000))
-
-    # Order payload
-    body = {
-        "contract_id": CONTRACT_ID,
-        "size": size,
-        "side": "buy" if direction == 1 else "sell",
+    order_payload = {
+        "product_id": 132,  # SOLUSDT Perp ID
+        "size": quantity,
+        "side": side,
         "order_type": "market",
-        "post_only": False,
-        "reduce_only": False,
-        "leverage": LEVERAGE
+        "time_in_force": "gtc",
+        "stop_loss": {"order_type": "market", "stop_price": stop_loss},
+        "take_profit": {"order_type": "market", "stop_price": take_profit}
     }
 
-    signature = generate_signature("POST", "/v2/orders", body, timestamp)
+    print("Placing order:", order_payload)
+    response = requests.post(
+        "https://api.delta.exchange/orders",
+        headers=headers,
+        json=order_payload
+    )
 
-    headers = {
-        "api-key": DELTA_API_KEY,
-        "timestamp": timestamp,
-        "signature": signature,
-        "Content-Type": "application/json"
-    }
-
-    order_url = f"{BASE_URL}/v2/orders"
-    res = requests.post(order_url, headers=headers, json=body)
-    print("Order response:", res.json())
-
-    # Take-profit and stop-loss
-    tp_price = round(entry_price * 1.10, 2)
-    sl_price = round(entry_price * 0.95, 2)
-    place_exit_order("limit", tp_price, size, direction, True)  # TP
-    place_exit_order("stop_market", sl_price, size, direction, True)  # SL
-
-def place_exit_order(order_type, price, size, direction, reduce_only):
-    timestamp = str(int(time.time() * 1000))
-
-    body = {
-        "contract_id": CONTRACT_ID,
-        "size": size,
-        "side": "sell" if direction == 1 else "buy",  # reverse side
-        "order_type": order_type,
-        "price": price if order_type == "limit" else None,
-        "stop_price": price if order_type == "stop_market" else None,
-        "reduce_only": reduce_only
-    }
-
-    signature = generate_signature("POST", "/v2/orders", body, timestamp)
-
-    headers = {
-        "api-key": DELTA_API_KEY,
-        "timestamp": timestamp,
-        "signature": signature,
-        "Content-Type": "application/json"
-    }
-
-    requests.post(f"{BASE_URL}/v2/orders", headers=headers, json=body)
-
-def generate_signature(method, path, body, timestamp):
-    message = f"{timestamp}{method.upper()}{path}{'' if body is None else str(body).replace(' ', '')}"
-    return hmac.new(DELTA_API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+    print("Delta Response:", response.status_code, response.text)
+    return '', 200
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8000))
