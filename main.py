@@ -1,17 +1,21 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import os
 import requests
 
 app = Flask(__name__)
 
-# Delta Exchange API credentials
 DELTA_API_KEY = os.getenv("DELTA_API_KEY")
 DELTA_API_SECRET = os.getenv("DELTA_API_SECRET")
 
-# Capital Settings
-TOTAL_CAPITAL = 10000  # ₹
-TRADE_PERCENT = 0.20  # 20%
+# Constants
+CAPITAL_RS = 10000
+CAPITAL_USDT = CAPITAL_RS / 83  # Approx INR→USDT
+ALLOCATION = 0.2  # 20% of capital
 LEVERAGE = 5
+TAKE_PROFIT_PERCENT = 0.10
+STOP_LOSS_PERCENT = 0.05
+
+DELTA_BASE_URL = "https://api.delta.exchange"
 
 @app.route('/', methods=['GET'])
 def home():
@@ -20,51 +24,45 @@ def home():
 @app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
-    print("Received alert:", data)
+    print("🔔 Received Alert:", data)
 
     signal = data.get("signal")
     symbol = data.get("symbol")
+    quantity = data.get("quantity", 0)
 
-    if signal not in ["buy", "sell"] or symbol != "SOLUSDT":
-        return "Invalid data", 400
+    if not signal or not symbol:
+        return jsonify({"error": "Missing signal or symbol"}), 400
 
-    # Fetch SOLUSDT price from Delta
-    price_data = requests.get("https://api.delta.exchange/v2/markets/SOLUSDT").json()
-    mark_price = float(price_data["result"]["mark_price"])
-    print("Mark Price:", mark_price)
+    # Calculate position size in USDT
+    allocated_usdt = CAPITAL_USDT * ALLOCATION
+    position_value = allocated_usdt * LEVERAGE
 
-    capital_to_use = TOTAL_CAPITAL * TRADE_PERCENT  # ₹2000
-    usdt_amount = capital_to_use * LEVERAGE         # ₹2000 * 5 = ₹10,000 worth
-    quantity = round(usdt_amount / mark_price, 4)   # Coin quantity to buy/sell
+    # Prepare order
+    order_payload = {
+        "product_symbol": symbol,
+        "size": position_value,
+        "order_type": "market",
+        "side": "buy" if signal == "buy" else "sell",
+        "leverage": LEVERAGE,
+        "reduce_only": False
+    }
 
-    side = "buy" if signal == "buy" else "sell"
-    stop_loss = round(mark_price * (0.95 if side == "buy" else 1.05), 2)
-    take_profit = round(mark_price * (1.10 if side == "buy" else 0.90), 2)
+    print("📦 Sending order:", order_payload)
 
+    # Make authenticated API call to Delta
     headers = {
         "api-key": DELTA_API_KEY,
+        "api-secret": DELTA_API_SECRET,
         "Content-Type": "application/json"
     }
 
-    order_payload = {
-        "product_id": 132,  # SOLUSDT Perp ID
-        "size": quantity,
-        "side": side,
-        "order_type": "market",
-        "time_in_force": "gtc",
-        "stop_loss": {"order_type": "market", "stop_price": stop_loss},
-        "take_profit": {"order_type": "market", "stop_price": take_profit}
-    }
+    response = requests.post(f"{DELTA_BASE_URL}/orders/create", json=order_payload, headers=headers)
+    print("📨 API Response:", response.status_code, response.text)
 
-    print("Placing order:", order_payload)
-    response = requests.post(
-        "https://api.delta.exchange/orders",
-        headers=headers,
-        json=order_payload
-    )
-
-    print("Delta Response:", response.status_code, response.text)
-    return '', 200
+    if response.status_code == 200:
+        return jsonify({"message": "Order placed"}), 200
+    else:
+        return jsonify({"error": "Failed to place order", "details": response.text}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8000))
